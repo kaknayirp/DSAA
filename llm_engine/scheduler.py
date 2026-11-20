@@ -199,7 +199,7 @@ class RequestScheduler:
             # Cancel and release KV Cache
             success = tracked.cancel()
             if tracked.stream_queue is not None:
-                tracked.stream_queue.put({"is_finished": True, "cancelled": True, "error": "Request cancelled."})
+                tracked.stream_queue.put({"type": "cancelled", "cancelled": True, "error": "Request cancelled."})
             logger.info("Cancelled request '%s'.", request_id)
             return success
 
@@ -286,9 +286,9 @@ class RequestScheduler:
                     if candidate.stream_queue is not None and state.generated_token_ids:
                         first_tok = state.generated_token_ids[-1]
                         candidate.stream_queue.put({
+                            "type": "token",
                             "token_id": first_tok,
-                            "text": self._decode_token(first_tok),
-                            "is_finished": state.is_finished,
+                            "text": self._decode_stream_delta(candidate),
                         })
 
                     if state.is_finished:
@@ -300,7 +300,7 @@ class RequestScheduler:
                     logger.error("Prefill failed for request '%s': %s", candidate.request_id, exc)
                     candidate.transition_to(RequestStatus.FAILED, error_msg=str(exc))
                     if candidate.stream_queue is not None:
-                        candidate.stream_queue.put({"is_finished": True, "error": str(exc)})
+                        candidate.stream_queue.put({"type": "error", "error": str(exc)})
                     report.failed_requests.append(candidate.request_id)
 
             # 4. Decode step for requests that were already decoding at step start
@@ -318,9 +318,9 @@ class RequestScheduler:
 
                     if tracked.stream_queue is not None:
                         tracked.stream_queue.put({
+                            "type": "token",
                             "token_id": token,
-                            "text": self._decode_token(token),
-                            "is_finished": is_finished,
+                            "text": self._decode_stream_delta(tracked),
                         })
 
                     if is_finished:
@@ -330,7 +330,7 @@ class RequestScheduler:
                     logger.error("Decode step failed for request '%s': %s", tracked.request_id, exc)
                     tracked.transition_to(RequestStatus.FAILED, error_msg=str(exc))
                     if tracked.stream_queue is not None:
-                        tracked.stream_queue.put({"is_finished": True, "error": str(exc)})
+                        tracked.stream_queue.put({"type": "error", "error": str(exc)})
                     report.failed_requests.append(tracked.request_id)
 
             # 4. Remove all terminal requests from active batch (frees slots for next iteration!)
@@ -483,13 +483,26 @@ class RequestScheduler:
         tracked.result = result
         tracked.transition_to(RequestStatus.COMPLETED)
         if tracked.stream_queue is not None:
-            tracked.stream_queue.put({"is_finished": True, "result": result})
+            tracked.stream_queue.put({"type": "complete", "result": result})
 
-    def _decode_token(self, token_id: int) -> str:
-        """Decode a single token ID into string representation."""
+    def _decode_stream_delta(self, tracked: TrackedRequest) -> str:
+        """Decode the cumulative generated prefix and return newly visible text."""
         if self.engine.tokenizer is not None and hasattr(self.engine.tokenizer, "decode"):
             try:
-                return self.engine.tokenizer.decode([token_id], skip_special_tokens=False)
+                try:
+                    decoded = self.engine.tokenizer.decode(
+                        tracked.state.generated_token_ids,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                except TypeError:
+                    decoded = self.engine.tokenizer.decode(
+                        tracked.state.generated_token_ids,
+                        skip_special_tokens=True,
+                    )
+                previous = tracked.streamed_text
+                tracked.streamed_text = decoded
+                return decoded[len(previous):] if decoded.startswith(previous) else decoded
             except Exception:
                 pass
-        return str(token_id)
+        return ""

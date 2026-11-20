@@ -139,9 +139,31 @@ class TestModelServingAPI(unittest.TestCase):
 
         self.assertIn("[DONE]", events)
         # Should have received at least 1 token chunk before [DONE]
-        token_events = [json.loads(e) for e in events if e != "[DONE]"]
-        self.assertGreaterEqual(len(token_events), 1)
-        self.assertIn("token_id", token_events[0])
+        payloads = [json.loads(e) for e in events if e != "[DONE]"]
+        token_events = [event for event in payloads if "token_id" in event]
+        completion = next(event for event in payloads if "finish_reason" in event)
+        self.assertEqual(len(token_events), 3)
+        self.assertEqual(completion["num_generated_tokens"], len(token_events))
+        self.assertEqual(completion["finish_reason"], "max_tokens")
+        self.assertTrue(all(isinstance(event["token_id"], int) for event in token_events))
+        self.assertTrue(all(event["text"] for event in token_events))
+
+    def test_stop_text_sequence_ends_stream_with_accurate_count(self):
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "Stop test", "max_new_tokens": 4, "stop_tokens": [")"], "stream": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        payloads = [
+            json.loads(line[6:])
+            for line in resp.iter_lines()
+            if line.startswith("data: ") and line[6:] != "[DONE]"
+        ]
+        token_events = [event for event in payloads if "token_id" in event]
+        completion = next(event for event in payloads if "finish_reason" in event)
+        self.assertEqual(completion["finish_reason"], "stop_sequence")
+        self.assertEqual(completion["num_generated_tokens"], len(token_events))
+        self.assertEqual(len(token_events), 1)
 
     def test_request_status_lifecycle(self):
         """GET /requests/{request_id} returns accurate execution state."""

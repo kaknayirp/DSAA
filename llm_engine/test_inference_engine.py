@@ -104,7 +104,7 @@ class MockTokenizer:
         self.eos_token_id = eos_token_id
         self.pad_token_id = eos_token_id
 
-    def __call__(self, text, return_tensors=None):
+    def __call__(self, text, return_tensors=None, **kwargs):
         # Deterministically convert string to token IDs
         tokens = [ord(c) % 500 + 1 for c in text[:20]]
         return {
@@ -113,7 +113,10 @@ class MockTokenizer:
         }
 
     def decode(self, token_ids, skip_special_tokens=True):
-        return f"decoded_text_length_{len(token_ids)}"
+        ids = [int(token_id) for token_id in token_ids]
+        if skip_special_tokens:
+            ids = [token_id for token_id in ids if token_id != self.eos_token_id]
+        return "".join(chr((token_id - 1) % 26 + ord("a")) for token_id in ids)
 
 
 class TestGenerationConfig(unittest.TestCase):
@@ -265,6 +268,21 @@ class TestInferenceEngineCore(unittest.TestCase):
         self.assertEqual(result.finish_reason, "eos")
         self.assertEqual(len(result.generated_token_ids), 1)
         self.assertEqual(result.generated_token_ids[0], 42)
+
+    def test_stop_token_sequence_termination(self):
+        request = InferenceRequest(
+            input_ids=[1, 2, 3],
+            generation_config=GenerationConfig(
+                max_new_tokens=5,
+                stop_token_sequences=[[42, 42]],
+            ),
+        )
+        state = self.engine.prefill(request)
+        self.assertFalse(state.is_finished)
+        _, finished = self.engine.decode_step(state)
+        self.assertTrue(finished)
+        self.assertEqual(state.generated_token_ids, [42, 42])
+        self.assertEqual(state.finish_reason, "stop_sequence")
 
     def test_cache_capacity_limit(self):
         """Verify generation stops if max_cache_capacity is reached."""

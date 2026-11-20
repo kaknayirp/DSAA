@@ -19,25 +19,16 @@ from llm_engine.server_config import ServerConfig
 from llm_engine.scheduler_config import SchedulerConfig
 from llm_engine.scheduler import RequestScheduler
 from llm_engine.inference_engine import InferenceEngine
-from llm_engine.model_loader import ModelArtifacts
-from llm_engine.test_inference_engine import StatefulCausalLM, MockTokenizer
+from llm_engine.model_loader import ModelLoader
 from llm_engine.api_app import create_app
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 def build_demo_app():
-    """Build FastAPI serving application with simulated Qwen2.5 model artifacts."""
-    model = StatefulCausalLM(vocab_size=1000, num_layers=4, num_kv_heads=2, head_dim=128)
-    tokenizer = MockTokenizer(eos_token_id=999)
-    artifacts = ModelArtifacts(
-        model=model,
-        tokenizer=tokenizer,
-        config=ModelConfig(model_id="Qwen/Qwen2.5-1.5B-Instruct"),
-        device="cpu",
-        dtype="float16",
-    )
-    engine = InferenceEngine(artifacts=artifacts)
+    """Build the serving app with the configured pretrained model loader."""
+    loader = ModelLoader(ModelConfig(model_id="Qwen/Qwen2.5-1.5B-Instruct"))
+    engine = InferenceEngine(model_loader=loader)
     scheduler = RequestScheduler(engine, SchedulerConfig(max_batch_size=4))
     server_cfg = ServerConfig(host="0.0.0.0", port=8000)
     return create_app(scheduler=scheduler, server_config=server_cfg, start_background_worker=True)
@@ -128,9 +119,9 @@ curl -X POST http://localhost:8000/requests/<request_id>/cancel
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--serve":
+    if len(sys.argv) > 1 and sys.argv[1] == "--demo":
+        run_api_demonstration()
+    else:
         import uvicorn
         app = build_demo_app()
         uvicorn.run(app, host="0.0.0.0", port=8000)
-    else:
-        run_api_demonstration()

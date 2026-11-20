@@ -277,6 +277,13 @@ def create_app(
             do_sample=req.do_sample,
             return_cache_report=True,
         )
+        if req.stop_tokens:
+            tokenizer = scheduler.engine.tokenizer
+            for stop_text in req.stop_tokens:
+                encoded_stop = tokenizer(stop_text, add_special_tokens=False, return_tensors="pt")
+                token_sequence = scheduler.engine._to_token_list(encoded_stop["input_ids"])
+                if token_sequence:
+                    gen_config.stop_token_sequences.append(token_sequence)
 
         # 1. Streaming response (Server-Sent Events)
         if req.stream:
@@ -308,17 +315,21 @@ def create_app(
                                 break
                             continue
 
-                        if chunk.get("is_finished"):
-                            if "error" in chunk:
+                        event_type = chunk.get("type", "token")
+                        if event_type in {"error", "cancelled", "complete"}:
+                            if event_type == "error":
                                 yield f"data: {json.dumps({'error': chunk['error'], 'code': 500})}\n\n"
-                            elif "cancelled" in chunk:
+                            elif event_type == "cancelled":
                                 yield f"data: {json.dumps({'cancelled': True, 'finish_reason': 'cancelled'})}\n\n"
                             else:
                                 res = chunk.get("result")
                                 final_payload = {
                                     "request_id": request_id,
-                                    "finish_reason": res.finish_reason if res else "completed",
-                                    "num_generated_tokens": res.num_generated_tokens if res else 0,
+                                    "finish_reason": res.finish_reason,
+                                    "num_prompt_tokens": res.num_prompt_tokens,
+                                    "num_generated_tokens": res.num_generated_tokens,
+                                    "total_time_seconds": round(res.total_time_seconds, 4),
+                                    "tokens_per_second": round(res.tokens_per_second, 2),
                                 }
                                 yield f"data: {json.dumps(final_payload)}\n\n"
                             yield "data: [DONE]\n\n"

@@ -222,6 +222,9 @@ class InferenceEngine:
         if first_token in request.generation_config.stop_token_set:
             state.is_finished = True
             state.finish_reason = "eos"
+        elif self._ends_with_stop_sequence(state.generated_token_ids, request.generation_config):
+            state.is_finished = True
+            state.finish_reason = "stop_sequence"
         elif len(state.generated_token_ids) >= request.generation_config.max_new_tokens:
             state.is_finished = True
             state.finish_reason = "max_tokens"
@@ -288,6 +291,9 @@ class InferenceEngine:
         if next_token in config.stop_token_set:
             state.is_finished = True
             state.finish_reason = "eos"
+        elif self._ends_with_stop_sequence(state.generated_token_ids, config):
+            state.is_finished = True
+            state.finish_reason = "stop_sequence"
         elif len(state.generated_token_ids) >= config.max_new_tokens:
             state.is_finished = True
             state.finish_reason = "max_tokens"
@@ -422,6 +428,16 @@ class InferenceEngine:
             elif hasattr(input_ids, "dim") and input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
 
+            # Hugging Face tokenizers usually return CPU tensors even when the
+            # model is placed on CUDA. Keep IDs and masks on the model device.
+            if hasattr(input_ids, "to"):
+                input_ids = input_ids.to(self.device)
+            if attention_mask is not None:
+                if isinstance(attention_mask, list):
+                    attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=self.device)
+                elif hasattr(attention_mask, "to"):
+                    attention_mask = attention_mask.to(self.device)
+
             if hasattr(input_ids, "shape"):
                 seq_len = input_ids.shape[-1]
             else:
@@ -454,6 +470,14 @@ class InferenceEngine:
             return torch.tensor([[position]], dtype=torch.long, device=self.device)
         except ImportError:
             return [[position]]
+
+    @staticmethod
+    def _ends_with_stop_sequence(token_ids: List[int], config: GenerationConfig) -> bool:
+        """Return True when generated IDs end in a configured token sequence."""
+        return any(
+            len(token_ids) >= len(sequence) and token_ids[-len(sequence):] == sequence
+            for sequence in config.stop_token_sequences
+        )
 
     def _to_token_list(self, input_ids: Any) -> List[int]:
         """Convert input_ids representation into a flat list of integers."""

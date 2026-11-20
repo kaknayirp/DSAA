@@ -23,6 +23,7 @@ class GenerationConfig:
     do_sample: bool = False
     eos_token_id: Optional[Union[int, List[int]]] = None
     stop_token_ids: List[int] = field(default_factory=list)
+    stop_token_sequences: List[List[int]] = field(default_factory=list)
     max_cache_capacity: Optional[int] = None
     repetition_penalty: float = 1.0
     return_cache_report: bool = True
@@ -79,3 +80,8 @@ class GenerationConfig:
             for st in self.stop_token_ids:
                 all_stops.add(int(st))
         self.stop_token_set = all_stops
+        self.stop_token_sequences = [
+            [int(token_id) for token_id in sequence]
+            for sequence in self.stop_token_sequences
+            if sequence
+        ]

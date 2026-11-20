@@ -216,8 +216,14 @@ curl -X POST http://localhost:8000/requests/<request_id>/cancel
 To launch the live Uvicorn HTTP server:
 
 ```bash
-python -m llm_engine.example_server --serve
+python -m llm_engine.example_server
 ```
+
+This command starts the API with the configured pretrained model loader. Model and
+tokenizer weights are loaded on the first inference request. It does not use the
+test-only `StatefulCausalLM` or `MockTokenizer`. Run `python -m
+llm_engine.example_server --demo` to exercise the HTTP flow from the demonstration
+client; this also uses the configured pretrained model.
 
 ---
 

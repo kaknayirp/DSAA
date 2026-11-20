@@ -45,6 +45,7 @@ class TrackedRequest:
     completed_at: Optional[float] = None
     completion_event: threading.Event = field(default_factory=threading.Event)
     stream_queue: Optional[Any] = None
+    streamed_text: str = ""
 
     @property
     def is_terminal(self) -> bool:
