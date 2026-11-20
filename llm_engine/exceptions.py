@@ -51,3 +51,24 @@ class ModelInitializationError(LLMEngineError):
 class TokenizerInitializationError(LLMEngineError):
     """Raised when tokenizer initialization fails or special tokens cannot be configured."""
     pass
+
+
+class InferenceEngineError(LLMEngineError):
+    """Base exception for errors during inference execution or autoregressive generation."""
+    pass
+
+
+class InvalidInputError(InferenceEngineError):
+    """Raised when an empty, malformed, or out-of-bounds input sequence is provided."""
+    pass
+
+
+class GenerationConfigError(InferenceEngineError):
+    """Raised when invalid generation parameters (e.g., negative temperature, top_p > 1) are passed."""
+    pass
+
+
+class CacheStateError(InferenceEngineError):
+    """Raised when the KV Cache state is missing, corrupted, or violates model invariants."""
+    pass
+

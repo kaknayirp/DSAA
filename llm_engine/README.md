@@ -3,7 +3,7 @@
 **Module Owner:** Person 1 — LLM & KV Cache Engineer  
 **Project:** DSAA (Dynamic Smart Attention-based Allocation)
 
-The `llm_engine/` module is the foundation of the DSAA system. It provides the core LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, configuring tokenizers for causal autoregressive generation, extracting and inspecting the Key-Value (KV) Cache, and managing cache state.
+The `llm_engine/` module is the foundation of the DSAA system. It provides the core LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, extracting and inspecting the Key-Value (KV) Cache, and executing autoregressive inference with incremental KV Cache updates.
 
 ---
 
@@ -13,165 +13,172 @@ The `llm_engine/` module is the foundation of the DSAA system. It provides the c
 llm_engine/
 ├── __init__.py                # Package exports for clean public API
 ├── config.py                  # ModelConfig, enums, device and precision resolution
-├── exceptions.py              # Custom error hierarchy (Dependency, Device, Precision, Download, OOM)
+├── generation_config.py       # GenerationConfig, sampling and stopping parameters
+├── exceptions.py              # Custom error hierarchy (Dependency, Device, Precision, OOM, Inference, Cache)
 ├── model_loader.py            # ModelLoader class and load_model_and_tokenizer helper
 ├── kv_extractor.py            # KVCacheInspector, TensorStats, CacheReport, memory calculations
+├── inference_engine.py        # InferenceEngine, InferenceRequest, GenerationState, InferenceResult
 ├── example_usage.py           # Standalone runnable model loader usage example
 ├── example_kv_inspection.py   # Standalone runnable KV Cache inspection & memory simulation
+├── example_inference.py       # Standalone runnable autoregressive generation & cache reuse demo
 ├── test_model_loader.py       # Unit tests for model loader (28 passing tests)
 ├── test_kv_extractor.py       # Unit tests for KV cache inspection & memory calculations (14 passing tests)
-└── README.md                  # Architecture documentation and usage guide
+├── test_inference_engine.py   # Unit tests for inference engine & KV cache integration (18 passing tests)
+└── README.md                  # Complete technical documentation and usage guide
 ```
 
 ---
 
-## 2. Core Components
+## 2. Architecture & Pipeline Overview
 
-### A. Configuration (`config.py`)
-Encapsulates all runtime parameters for inference:
-* **Primary Candidate:** `Qwen/Qwen2.5-1.5B-Instruct` (default)
-* **Alternative Candidates:** `google/gemma-2-2b-it`, `meta-llama/Llama-3.1-8B-Instruct`
-* **Device Resolution (`resolve_device`):**
-  * `"auto"`: Auto-detects CUDA; falls back to CPU if unavailable.
-  * `"cuda"` / `"cuda:<idx>"`: Validates CUDA availability on hardware; raises `DeviceConfigurationError` if missing.
-  * `"cpu"`: Forces CPU execution.
-* **Precision Resolution (`resolve_precision`):**
-  * `"auto"`:
-    * CUDA with BF16 instruction support $\rightarrow$ `torch.bfloat16`
-    * CUDA without BF16 support $\rightarrow$ `torch.float16`
-    * CPU fallback $\rightarrow$ `torch.float32` (ensuring broad kernel support and numerical stability).
-  * Explicit modes (`float32`, `float16`, `bfloat16`) are validated against hardware capabilities. Attempting `float16` on CPU or `bfloat16` on unsupported GPUs raises `PrecisionConfigurationError`.
-* **Causal Autoregressive Defaults:**
-  * `padding_side = "left"`: Mandatory for decoder-only autoregressive generation so that padding does not alter sequence position embeddings.
-  * `use_cache = True`: Ensures the transformer produces and maintains the KV Cache during forward passes.
-
-### B. Model Loader (`model_loader.py`)
-Responsible for loading, preparing, and managing the model lifecycle:
-* **Dependency Verification:** Validates that `torch` and `transformers` are present; raises `DependencyMissingError` with specific installation commands if missing.
-* **Model Configuration for Inference:**
-  * `model.eval()`: Puts layers (Dropout, BatchNorm) into inference mode.
-  * `param.requires_grad = False`: Freezes all parameters to eliminate autograd overhead and save memory.
-  * `model.config.use_cache = True`: Explicitly enables KV Cache generation.
-* **Tokenizer Setup:**
-  * Configures left padding.
-  * Ensures `pad_token` is mapped (falls back to `eos_token` if `pad_token` is undefined, preventing padding-token crashes).
-* **Resource Caching & Cleanup:**
-  * `load()` caches `ModelArtifacts` to prevent duplicate memory allocations when accessed repeatedly.
-  * `unload()` explicitly deletes references, triggers garbage collection (`gc.collect()`), and clears CUDA cache (`torch.cuda.empty_cache()`).
-
-### C. KV Cache Extraction & Inspection (`kv_extractor.py`)
-Provides non-destructive extraction, inspection, and memory profiling of the model's Key-Value Cache:
-* **Supported Cache Representations:**
-  * **Hugging Face `DynamicCache`** (`transformers.cache_utils.DynamicCache`): standard across modern Transformers ($\ge 4.36$).
-  * **Legacy Tuple of Tuples:** `((key_0, value_0), (key_1, value_1), ..., (key_{L-1}, value_{L-1}))`.
-  * **List of Tuples / Custom Sequence Containers.**
-* **Tensor Layout Inspection:**
-  * Identifies standard 4D layout: `[batch_size, num_kv_heads, seq_len, head_dim]`.
-  * Automatically detects **Grouped Query Attention (GQA)** when `num_kv_heads < 8`.
-* **Memory Calculation Methodology:**
-  * **Logical Tensor Memory:** Calculated as $\text{numel} \times \text{element\_size\_bytes}$.
-  * **Physical Storage Tracking:** Queries underlying storage pointer (`untyped_storage().data_ptr()`) to avoid double-counting shared or preallocated tensor memory buffers.
-  * Reports memory precisely in bytes, kilobytes (KB), and megabytes (MB) at tensor, layer, and global cache levels.
-* **Structured Output (`CacheReport`):**
-  * Provides serialized dictionary (`to_dict()`) for integration with Person 2 (algorithm) and Person 3 (evaluation/dashboard).
-  * Provides formatted ASCII summary table (`summary_table()`).
+```
+                                  [ User Input / Prompt ]
+                                             │
+                                             ▼
+                             ┌───────────────────────────────┐
+                             │       Tokenizer (Left-Pad)     │
+                             └───────────────┬───────────────┘
+                                             │
+                                     [ Input Token IDs ]
+                                             │
+                                             ▼
+                                  ┌────────────────────┐
+                                  │  InferenceEngine   │
+                                  └──────────┬─────────┘
+                                             │
+                       ┌─────────────────────┴─────────────────────┐
+                       ▼                                           ▼
+             [ 1. Prefill Stage ]                        [ 2. Decode Stage ]
+      Processes prompt (N tokens) at once        Processes 1 token per iteration
+        Generates past_key_values (N)             Feeds token + past_key_values
+      Returns first generated token (t_0)          Incremental cache update (N+1, N+2...)
+                       │                                           │
+                       └─────────────────────┬─────────────────────┘
+                                             │
+                                             ▼
+                             ┌───────────────────────────────┐
+                             │    KVCacheInspector (Prompt 2) │
+                             │  - Non-destructive inspection │
+                             │  - Memory breakdown (B, KB, MB)│
+                             │  - CacheReport generation     │
+                             └───────────────┬───────────────┘
+                                             │
+                                             ▼
+                                    [ InferenceResult ]
+                              - generated_token_ids
+                              - decoded_text
+                              - latency & throughput
+                              - final_cache_report
+```
 
 ---
 
-## 3. Qwen2.5-1.5B-Instruct Cache Architecture & Dimensions
+## 3. Core Components
 
-For our primary candidate model, `Qwen/Qwen2.5-1.5B-Instruct`, the KV Cache exhibits the following observed specifications:
+### A. Configuration (`config.py` & `generation_config.py`)
+* **`ModelConfig`:** Hardware resolution (`auto`, `cuda`, `cpu`), precision modes (`float32`, `float16`, `bfloat16`), left-padding, and model candidate identifiers (`Qwen/Qwen2.5-1.5B-Instruct` default).
+* **`GenerationConfig`:** Decoding settings:
+  * `max_new_tokens`: token budget.
+  * `temperature`, `top_k`, `top_p`: sampling distribution controls.
+  * `do_sample`: toggle between greedy (`argmax`) and stochastic sampling.
+  * `repetition_penalty`: discounts already-generated tokens.
+  * `stop_token_ids` & `eos_token_id`: early exit triggers.
+  * `max_cache_capacity`: enforces hardware memory bounds on the KV Cache.
 
-* **Transformer Layers ($L$):** 28
-* **Attention Heads:** 12 query heads, **2 key-value heads** (Grouped Query Attention - GQA)
-* **Head Dimension ($D$):** 128 ($1536 / 12$)
-* **Default Precision:** `bfloat16` / `float16` (2 bytes per element)
-* **Key/Value Tensor Shape per Layer:** `(batch_size, 2, seq_len, 128)`
-* **Memory Scaling per Token:**
-  $$\text{Elements per Token per Layer} = 2 \text{ (K + V)} \times 1 \text{ (batch)} \times 2 \text{ (KV heads)} \times 128 \text{ (head dim)} = 512 \text{ elements}$$
-  $$\text{Memory per Token per Layer} = 512 \times 2 \text{ bytes} = 1,024 \text{ bytes} = 1.00 \text{ KB}$$
-  $$\text{Total Memory per Token across 28 Layers} = 28 \times 1,024 \text{ bytes} = 28,672 \text{ bytes} = \mathbf{28.00 \text{ KB/token}}$$
+### B. Model Loader (`model_loader.py`)
+* Pretrained causal language model initialization.
+* Parameter freezing (`requires_grad = False`) and inference mode (`model.eval()`).
+* Explicit cache enabling (`model.config.use_cache = True`).
+* Idempotent caching and memory cleanup (`unload()`).
 
-### Context Length Footprint Table
-| Sequence Length | Key/Value Shape | Total KV Cache Memory | Memory per Token |
-|:---|:---|:---|:---|
-| 128 tokens | `(1, 2, 128, 128)` | **3.50 MB** | 28.00 KB |
-| 512 tokens | `(1, 2, 512, 128)` | **14.00 MB** | 28.00 KB |
-| 2,048 tokens | `(1, 2, 2048, 128)` | **56.00 MB** | 28.00 KB |
-| 8,192 tokens | `(1, 2, 8192, 128)` | **224.00 MB** | 28.00 KB |
-| 32,768 tokens | `(1, 2, 32768, 128)` | **896.00 MB** | 28.00 KB |
+### C. KV Cache Extraction & Inspection (`kv_extractor.py`)
+* Normalizes `DynamicCache` and tuple-based caches into uniform layer tensors.
+* Inspects Key and Value shapes: `[batch_size, num_kv_heads, seq_len, head_dim]`.
+* Detects Grouped Query Attention (GQA) (e.g. Qwen2.5 uses 2 KV heads vs 12 Q heads).
+* Calculates exact logical memory and tracks physical buffer pointers to avoid double-counting.
+
+### D. Inference Engine (`inference_engine.py`)
+* **Prefill Stage:**
+  1. Validates prompt token sequence.
+  2. Executes single model forward pass for the complete prompt.
+  3. Initializes `past_key_values` in an isolated `GenerationState`.
+  4. Selects first token from prompt's final logits.
+* **Decode Stage:**
+  1. Supplies only the single latest token `[1, 1]` to `model()`.
+  2. Supplies existing `past_key_values` — **strictly avoiding recomputation of prompt tokens**.
+  3. Model returns new logits and appends new Key/Value representations to the cache.
+  4. Checks stopping conditions (EOS, stop token, max tokens, capacity).
+* **Request & Cache Lifecycle:**
+  * Every request receives an independent `GenerationState`.
+  * Guarantees zero cross-request contamination.
+  * Safe cleanup: `state.cleanup()` drops tensor references upon generation exit.
+* **Prompt 2 Integration:**
+  * Embeds a full `CacheReport` directly in `InferenceResult.final_cache_report`.
 
 ---
 
 ## 4. Usage Examples
 
-### Inspecting KV Cache from Model Inference
+### Full Autoregressive Generation with KV Cache
 
 ```python
-from llm_engine import ModelLoader, ModelConfig, run_inference_and_inspect_cache
+from llm_engine import ModelLoader, ModelConfig, InferenceEngine, GenerationConfig
 
-# 1. Load model and tokenizer
+# 1. Load Model and Initialize Engine
 config = ModelConfig(model_id="Qwen/Qwen2.5-1.5B-Instruct", device="auto")
 loader = ModelLoader(config)
-artifacts = loader.load()
+engine = InferenceEngine(model_loader=loader)
 
-# 2. Run inference and extract cache report
-outputs, report = run_inference_and_inspect_cache(
-    model=artifacts.model,
-    tokenizer=artifacts.tokenizer,
-    prompt="Explain KV Cache in Large Language Models."
+# 2. Configure Generation
+gen_config = GenerationConfig(
+    max_new_tokens=64,
+    temperature=0.7,
+    top_p=0.9,
+    do_sample=True,
 )
 
-# 3. Print human-readable summary
-print(report.summary_table())
+# 3. Generate Tokens
+result = engine.generate(
+    prompt="Explain the difference between prefill and decode stages in LLMs.",
+    generation_config=gen_config,
+    inspect_cache=True,
+)
 
-# 4. Programmatic access for algorithm/eval modules
-print(f"Total KV Memory: {report.total_mb:.2f} MB")
-print(f"Layer 0 Key shape: {report.layers[0].key.shape}")
-print(f"Layer 0 Total bytes: {report.layers[0].total_bytes} bytes")
-```
-
-### Inspecting an Existing `past_key_values` Object
-
-```python
-from llm_engine import extract_kv_cache
-
-# past_key_values can be DynamicCache or tuple of tuples
-report = extract_kv_cache(past_key_values)
-print(f"Detected cache type: {report.cache_type}")
-print(f"Total KV cache size: {report.total_kb:.2f} KB")
+# 4. View Results and KV Cache Statistics
+print(result.summary())
+print(f"Generated text: {result.decoded_text}")
+print(f"Final KV Cache Memory: {result.final_cache_report.total_mb:.2f} MB")
 ```
 
 ---
 
-## 5. Running Tests
+## 5. Running the Test Suite
 
-Unit tests are strictly self-contained within `llm_engine/` and run without external downloads or active GPUs.
+All unit and integration tests are strictly self-contained within `llm_engine/`:
 
-Run all tests:
 ```bash
+# Run all 60 tests across the entire module
 python -m unittest discover -s llm_engine -p "test_*.py" -v
 ```
 
-Or run individual suites:
-```bash
-# Model Loader tests (28 tests)
-python -m unittest llm_engine.test_model_loader -v
+### Individual Test Suites:
+1. **Model Loader Tests (28 tests):** `python -m unittest llm_engine.test_model_loader -v`
+2. **KV Cache Extractor Tests (14 tests):** `python -m unittest llm_engine.test_kv_extractor -v`
+3. **Inference Engine Tests (18 tests):** `python -m unittest llm_engine.test_inference_engine -v`
 
-# KV Cache Extractor tests (14 tests)
-python -m unittest llm_engine.test_kv_extractor -v
-```
-
-Total: **42 tests, 0 failures, 0 errors**.
+Total: **60 tests, 0 failures, 0 errors**.
 
 ---
 
 ## 6. Standalone Demonstration Scripts
 
 ```bash
-# Model loader demonstration
+# Model Loader demo
 python -m llm_engine.example_usage
 
-# KV Cache inspection & memory simulation
+# KV Cache inspection & Qwen2.5 memory scaling simulation
 python -m llm_engine.example_kv_inspection
+
+# Complete autoregressive inference engine demo
+python -m llm_engine.example_inference
 ```
