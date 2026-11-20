@@ -72,3 +72,29 @@ class CacheStateError(InferenceEngineError):
     """Raised when the KV Cache state is missing, corrupted, or violates model invariants."""
     pass
 
+
+class SchedulerError(InferenceEngineError):
+    """Base exception for request scheduling and continuous batching errors."""
+    pass
+
+
+class QueueFullError(SchedulerError):
+    """Raised when the scheduler request queue exceeds its maximum capacity."""
+    pass
+
+
+class RequestNotFoundError(SchedulerError):
+    """Raised when an operation references a non-existent request ID."""
+    pass
+
+
+class RequestCancelledError(SchedulerError):
+    """Raised when attempting to execute or retrieve results for a cancelled request."""
+    pass
+
+
+class RequestTimeoutError(SchedulerError):
+    """Raised when a request exceeds its maximum execution or waiting timeout."""
+    pass
+
+

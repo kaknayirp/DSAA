@@ -3,7 +3,7 @@
 **Module Owner:** Person 1 — LLM & KV Cache Engineer  
 **Project:** DSAA (Dynamic Smart Attention-based Allocation)
 
-The `llm_engine/` module is the foundation of the DSAA system. It provides the core LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, extracting and inspecting the Key-Value (KV) Cache, and executing autoregressive inference with incremental KV Cache updates.
+The `llm_engine/` module is the foundation of the DSAA system. It provides the complete LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, extracting and inspecting the Key-Value (KV) Cache, executing autoregressive inference, managing continuous batching request scheduling, and exposing the entire infrastructure through a robust, production-grade FastAPI serving layer.
 
 ---
 
@@ -11,174 +11,230 @@ The `llm_engine/` module is the foundation of the DSAA system. It provides the c
 
 ```text
 llm_engine/
-├── __init__.py                # Package exports for clean public API
-├── config.py                  # ModelConfig, enums, device and precision resolution
-├── generation_config.py       # GenerationConfig, sampling and stopping parameters
-├── exceptions.py              # Custom error hierarchy (Dependency, Device, Precision, OOM, Inference, Cache)
-├── model_loader.py            # ModelLoader class and load_model_and_tokenizer helper
-├── kv_extractor.py            # KVCacheInspector, TensorStats, CacheReport, memory calculations
-├── inference_engine.py        # InferenceEngine, InferenceRequest, GenerationState, InferenceResult
-├── example_usage.py           # Standalone runnable model loader usage example
-├── example_kv_inspection.py   # Standalone runnable KV Cache inspection & memory simulation
-├── example_inference.py       # Standalone runnable autoregressive generation & cache reuse demo
-├── test_model_loader.py       # Unit tests for model loader (28 passing tests)
-├── test_kv_extractor.py       # Unit tests for KV cache inspection & memory calculations (14 passing tests)
-├── test_inference_engine.py   # Unit tests for inference engine & KV cache integration (18 passing tests)
-└── README.md                  # Complete technical documentation and usage guide
+├── __init__.py                     # Package exports for clean public API
+├── config.py                       # ModelConfig, enums, device and precision resolution
+├── generation_config.py            # GenerationConfig, sampling and stopping parameters
+├── scheduler_config.py             # SchedulerConfig, batch sizes, scheduling policies, timeouts
+├── server_config.py                # ServerConfig, host, port, CORS, request size/timeout limits
+├── request_tracker.py              # TrackedRequest, RequestStatus state machine, cancellation
+├── api_schemas.py                  # Pydantic schemas for requests, responses, and errors
+├── api_app.py                      # FastAPI application, lifespan, endpoints, streaming SSE
+├── exceptions.py                   # Custom error hierarchy (Model, Device, Cache, Inference, Scheduler)
+├── model_loader.py                 # ModelLoader class and load_model_and_tokenizer helper
+├── kv_extractor.py                 # KVCacheInspector, TensorStats, CacheReport, memory calculations
+├── inference_engine.py             # InferenceEngine, InferenceRequest, GenerationState, InferenceResult
+├── scheduler.py                    # RequestScheduler, BatchStepReport, iteration-level continuous batching
+├── example_usage.py                # Standalone runnable model loader usage example
+├── example_kv_inspection.py        # Standalone runnable KV Cache inspection & memory simulation
+├── example_inference.py            # Standalone runnable autoregressive generation & cache reuse demo
+├── example_continuous_batching.py  # Standalone runnable continuous batching dynamic entry/exit demo
+├── example_server.py               # Standalone runnable API server & client demonstration
+├── test_model_loader.py            # Unit tests for model loader (28 passing tests)
+├── test_kv_extractor.py            # Unit tests for KV cache inspection & memory calculations (14 passing tests)
+├── test_inference_engine.py        # Unit tests for inference engine & KV cache integration (18 passing tests)
+├── test_scheduler.py               # Unit tests for continuous batching and scheduling (13 passing tests)
+├── test_api.py                     # Unit and integration tests for serving API (11 passing tests)
+└── README.md                       # Complete technical documentation and usage guide
 ```
 
 ---
 
-## 2. Architecture & Pipeline Overview
+## 2. Serving & Inference Architecture
+
+The API layer is directly integrated with the existing continuous batching scheduler and inference engine:
 
 ```
-                                  [ User Input / Prompt ]
-                                             │
-                                             ▼
-                             ┌───────────────────────────────┐
-                             │       Tokenizer (Left-Pad)     │
-                             └───────────────┬───────────────┘
-                                             │
-                                     [ Input Token IDs ]
-                                             │
-                                             ▼
-                                  ┌────────────────────┐
-                                  │  InferenceEngine   │
-                                  └──────────┬─────────┘
-                                             │
-                       ┌─────────────────────┴─────────────────────┐
-                       ▼                                           ▼
-             [ 1. Prefill Stage ]                        [ 2. Decode Stage ]
-      Processes prompt (N tokens) at once        Processes 1 token per iteration
-        Generates past_key_values (N)             Feeds token + past_key_values
-      Returns first generated token (t_0)          Incremental cache update (N+1, N+2...)
-                       │                                           │
-                       └─────────────────────┬─────────────────────┘
-                                             │
-                                             ▼
-                             ┌───────────────────────────────┐
-                             │    KVCacheInspector (Prompt 2) │
-                             │  - Non-destructive inspection │
-                             │  - Memory breakdown (B, KB, MB)│
-                             │  - CacheReport generation     │
-                             └───────────────┬───────────────┘
-                                             │
-                                             ▼
-                                    [ InferenceResult ]
-                              - generated_token_ids
-                              - decoded_text
-                              - latency & throughput
-                              - final_cache_report
+  [ HTTP Client / Browser / Dashboard ]
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │     FastAPI App       │  (api_app.py)
+       │  CORS, Auth, Schemas  │
+       └───────────┬───────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │   RequestScheduler    │  (scheduler.py - Prompt 4)
+       │  Continuous Batching  │
+       └───────────┬───────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │   InferenceEngine     │  (inference_engine.py - Prompt 3)
+       │   Prefill & Decode    │
+       └───────────┬───────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │   KVCacheInspector    │  (kv_extractor.py - Prompt 2)
+       │ Memory Profiling (MB) │
+       └───────────┬───────────┘
+                   │
+                   ▼
+       [ Structured HTTP Response / SSE Stream ]
 ```
 
 ---
 
-## 3. Core Components
+## 3. REST API Endpoints
 
-### A. Configuration (`config.py` & `generation_config.py`)
-* **`ModelConfig`:** Hardware resolution (`auto`, `cuda`, `cpu`), precision modes (`float32`, `float16`, `bfloat16`), left-padding, and model candidate identifiers (`Qwen/Qwen2.5-1.5B-Instruct` default).
-* **`GenerationConfig`:** Decoding settings:
-  * `max_new_tokens`: token budget.
-  * `temperature`, `top_k`, `top_p`: sampling distribution controls.
-  * `do_sample`: toggle between greedy (`argmax`) and stochastic sampling.
-  * `repetition_penalty`: discounts already-generated tokens.
-  * `stop_token_ids` & `eos_token_id`: early exit triggers.
-  * `max_cache_capacity`: enforces hardware memory bounds on the KV Cache.
+### `GET /health`
+Returns health status, active and queued requests, uptime, and hardware device.
 
-### B. Model Loader (`model_loader.py`)
-* Pretrained causal language model initialization.
-* Parameter freezing (`requires_grad = False`) and inference mode (`model.eval()`).
-* Explicit cache enabling (`model.config.use_cache = True`).
-* Idempotent caching and memory cleanup (`unload()`).
-
-### C. KV Cache Extraction & Inspection (`kv_extractor.py`)
-* Normalizes `DynamicCache` and tuple-based caches into uniform layer tensors.
-* Inspects Key and Value shapes: `[batch_size, num_kv_heads, seq_len, head_dim]`.
-* Detects Grouped Query Attention (GQA) (e.g. Qwen2.5 uses 2 KV heads vs 12 Q heads).
-* Calculates exact logical memory and tracks physical buffer pointers to avoid double-counting.
-
-### D. Inference Engine (`inference_engine.py`)
-* **Prefill Stage:**
-  1. Validates prompt token sequence.
-  2. Executes single model forward pass for the complete prompt.
-  3. Initializes `past_key_values` in an isolated `GenerationState`.
-  4. Selects first token from prompt's final logits.
-* **Decode Stage:**
-  1. Supplies only the single latest token `[1, 1]` to `model()`.
-  2. Supplies existing `past_key_values` — **strictly avoiding recomputation of prompt tokens**.
-  3. Model returns new logits and appends new Key/Value representations to the cache.
-  4. Checks stopping conditions (EOS, stop token, max tokens, capacity).
-* **Request & Cache Lifecycle:**
-  * Every request receives an independent `GenerationState`.
-  * Guarantees zero cross-request contamination.
-  * Safe cleanup: `state.cleanup()` drops tensor references upon generation exit.
-* **Prompt 2 Integration:**
-  * Embeds a full `CacheReport` directly in `InferenceResult.final_cache_report`.
-
----
-
-## 4. Usage Examples
-
-### Full Autoregressive Generation with KV Cache
-
-```python
-from llm_engine import ModelLoader, ModelConfig, InferenceEngine, GenerationConfig
-
-# 1. Load Model and Initialize Engine
-config = ModelConfig(model_id="Qwen/Qwen2.5-1.5B-Instruct", device="auto")
-loader = ModelLoader(config)
-engine = InferenceEngine(model_loader=loader)
-
-# 2. Configure Generation
-gen_config = GenerationConfig(
-    max_new_tokens=64,
-    temperature=0.7,
-    top_p=0.9,
-    do_sample=True,
-)
-
-# 3. Generate Tokens
-result = engine.generate(
-    prompt="Explain the difference between prefill and decode stages in LLMs.",
-    generation_config=gen_config,
-    inspect_cache=True,
-)
-
-# 4. View Results and KV Cache Statistics
-print(result.summary())
-print(f"Generated text: {result.decoded_text}")
-print(f"Final KV Cache Memory: {result.final_cache_report.total_mb:.2f} MB")
+**Response:**
+```json
+{
+  "status": "healthy",
+  "model_loaded": true,
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "device": "cpu",
+  "active_requests": 0,
+  "queued_requests": 0,
+  "uptime_seconds": 12.4
+}
 ```
 
 ---
 
-## 5. Running the Test Suite
+### `GET /models`
+Returns list of active and supported candidate models.
 
-All unit and integration tests are strictly self-contained within `llm_engine/`:
+**Response:**
+```json
+{
+  "models": [
+    {
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "device": "cpu",
+      "precision": "auto",
+      "context_length": 4096,
+      "is_active": true
+    },
+    {
+      "model_id": "google/gemma-2-2b-it",
+      "device": "cpu",
+      "precision": "auto",
+      "context_length": 4096,
+      "is_active": false
+    }
+  ],
+  "active_model": "Qwen/Qwen2.5-1.5B-Instruct"
+}
+```
+
+---
+
+### `POST /generate`
+Generates text from prompt. Supports blocking JSON or streaming Server-Sent Events (SSE).
+
+**Request (JSON):**
+```json
+{
+  "prompt": "Explain KV Cache in LLMs.",
+  "max_new_tokens": 64,
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "stream": false
+}
+```
+
+**Response (Blocking JSON):**
+```json
+{
+  "request_id": "47457df8",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "generated_text": "The KV Cache stores previous keys and values...",
+  "finish_reason": "max_tokens",
+  "num_prompt_tokens": 12,
+  "num_generated_tokens": 64,
+  "total_time_seconds": 0.42,
+  "tokens_per_second": 152.38,
+  "kv_cache_summary": {
+    "total_bytes": 102400,
+    "total_kb": 100.0,
+    "total_mb": 0.0977,
+    "num_layers": 4,
+    "seq_len": 75,
+    "is_gqa": true
+  }
+}
+```
+
+**Streaming (SSE - `stream: true`):**
+```text
+data: {"request_id": "e5707ad8", "token_id": 42, "text": "The"}
+
+data: {"request_id": "e5707ad8", "token_id": 105, "text": " KV"}
+
+data: {"request_id": "e5707ad8", "finish_reason": "completed", "num_generated_tokens": 2}
+
+data: [DONE]
+```
+
+---
+
+### `GET /requests/{request_id}`
+Returns current status of a request: `PENDING`, `QUEUED`, `PREFILLING`, `DECODING`, `COMPLETED`, `FAILED`, or `CANCELLED`.
+
+---
+
+### `POST /requests/{request_id}/cancel`
+Cancels a running or queued request, stops decoding, and immediately releases its KV Cache tensors.
+
+---
+
+## 4. Example `curl` Commands
 
 ```bash
-# Run all 60 tests across the entire module
+# Health check
+curl -X GET http://localhost:8000/health
+
+# List models
+curl -X GET http://localhost:8000/models
+
+# Standard text generation
+curl -X POST http://localhost:8000/generate \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "What is DSAA?", "max_new_tokens": 32, "temperature": 0.7}'
+
+# Streaming text generation (SSE)
+curl -X POST http://localhost:8000/generate \
+     -H "Content-Type: application/json" \
+     -d '{"prompt": "Explain continuous batching.", "max_new_tokens": 32, "stream": true}'
+
+# Request status
+curl -X GET http://localhost:8000/requests/<request_id>
+
+# Cancel request
+curl -X POST http://localhost:8000/requests/<request_id>/cancel
+```
+
+---
+
+## 5. Starting the Server
+
+To launch the live Uvicorn HTTP server:
+
+```bash
+python -m llm_engine.example_server --serve
+```
+
+---
+
+## 6. Running the Complete Test Suite
+
+All 84 unit and integration tests across `llm_engine/` are strictly self-contained:
+
+```bash
+# Run all 84 tests across all 5 milestones
 python -m unittest discover -s llm_engine -p "test_*.py" -v
 ```
 
-### Individual Test Suites:
+### Breakdown by Component:
 1. **Model Loader Tests (28 tests):** `python -m unittest llm_engine.test_model_loader -v`
 2. **KV Cache Extractor Tests (14 tests):** `python -m unittest llm_engine.test_kv_extractor -v`
 3. **Inference Engine Tests (18 tests):** `python -m unittest llm_engine.test_inference_engine -v`
+4. **Scheduler & Continuous Batching Tests (13 tests):** `python -m unittest llm_engine.test_scheduler -v`
+5. **Model Serving & API Tests (11 tests):** `python -m unittest llm_engine.test_api -v`
 
-Total: **60 tests, 0 failures, 0 errors**.
-
----
-
-## 6. Standalone Demonstration Scripts
-
-```bash
-# Model Loader demo
-python -m llm_engine.example_usage
-
-# KV Cache inspection & Qwen2.5 memory scaling simulation
-python -m llm_engine.example_kv_inspection
-
-# Complete autoregressive inference engine demo
-python -m llm_engine.example_inference
-```
+Total: **84 tests, 0 failures, 0 errors**.

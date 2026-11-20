@@ -3,7 +3,8 @@ DSAA LLM Engine Module.
 
 Owned by Person 1 — LLM & KV Cache Engineer.
 Provides model loading, configuration, device/precision management,
-KV Cache extraction, inspection, and autoregressive inference execution.
+KV Cache extraction, inspection, autoregressive inference execution,
+continuous batching request scheduling, and FastAPI model serving layer.
 """
 
 from .config import (
@@ -16,6 +17,9 @@ from .config import (
     resolve_precision,
 )
 from .generation_config import GenerationConfig
+from .scheduler_config import SchedulerConfig, SchedulingPolicy
+from .server_config import ServerConfig
+from .request_tracker import RequestStatus, TrackedRequest
 from .exceptions import (
     LLMEngineError,
     DependencyMissingError,
@@ -29,6 +33,11 @@ from .exceptions import (
     InvalidInputError,
     GenerationConfigError,
     CacheStateError,
+    SchedulerError,
+    QueueFullError,
+    RequestNotFoundError,
+    RequestCancelledError,
+    RequestTimeoutError,
 )
 from .model_loader import (
     ModelLoader,
@@ -50,11 +59,30 @@ from .inference_engine import (
     GenerationState,
     InferenceResult,
 )
+from .scheduler import (
+    RequestScheduler,
+    BatchStepReport,
+)
+from .api_schemas import (
+    GenerateRequest,
+    GenerateResponse,
+    RequestStatusResponse,
+    CancelResponse,
+    HealthResponse,
+    ModelInfo,
+    ModelListResponse,
+    KVCacheSummary,
+    ErrorResponse,
+)
+from .api_app import create_app
 
 __all__ = [
     # Config
     "ModelConfig",
     "GenerationConfig",
+    "SchedulerConfig",
+    "ServerConfig",
+    "SchedulingPolicy",
     "DeviceType",
     "PrecisionMode",
     "DEFAULT_MODEL_ID",
@@ -74,6 +102,11 @@ __all__ = [
     "InvalidInputError",
     "GenerationConfigError",
     "CacheStateError",
+    "SchedulerError",
+    "QueueFullError",
+    "RequestNotFoundError",
+    "RequestCancelledError",
+    "RequestTimeoutError",
     # Model Loading
     "ModelLoader",
     "ModelArtifacts",
@@ -91,4 +124,20 @@ __all__ = [
     "InferenceRequest",
     "GenerationState",
     "InferenceResult",
+    # Continuous Batching Scheduler
+    "RequestScheduler",
+    "BatchStepReport",
+    "RequestStatus",
+    "TrackedRequest",
+    # Serving & API Layer
+    "create_app",
+    "GenerateRequest",
+    "GenerateResponse",
+    "RequestStatusResponse",
+    "CancelResponse",
+    "HealthResponse",
+    "ModelInfo",
+    "ModelListResponse",
+    "KVCacheSummary",
+    "ErrorResponse",
 ]
