@@ -3,7 +3,7 @@
 **Module Owner:** Person 1 — LLM & KV Cache Engineer  
 **Project:** DSAA (Dynamic Smart Attention-based Allocation)
 
-The `llm_engine/` module is the foundation of the DSAA system. It provides the core LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, configuring tokenizers for causal autoregressive generation, and managing the Key-Value (KV) Cache.
+The `llm_engine/` module is the foundation of the DSAA system. It provides the core LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, configuring tokenizers for causal autoregressive generation, extracting and inspecting the Key-Value (KV) Cache, and managing cache state.
 
 ---
 
@@ -11,13 +11,16 @@ The `llm_engine/` module is the foundation of the DSAA system. It provides the c
 
 ```text
 llm_engine/
-├── __init__.py           # Package exports for clean public API
-├── config.py             # ModelConfig, enums, device and precision resolution
-├── exceptions.py         # Custom error hierarchy (Dependency, Device, Precision, Download, OOM)
-├── model_loader.py       # ModelLoader class and load_model_and_tokenizer helper
-├── example_usage.py      # Standalone runnable usage example
-├── test_model_loader.py  # Unit tests with isolated mocks (28 passing tests)
-└── README.md             # Architecture documentation and usage guide
+├── __init__.py                # Package exports for clean public API
+├── config.py                  # ModelConfig, enums, device and precision resolution
+├── exceptions.py              # Custom error hierarchy (Dependency, Device, Precision, Download, OOM)
+├── model_loader.py            # ModelLoader class and load_model_and_tokenizer helper
+├── kv_extractor.py            # KVCacheInspector, TensorStats, CacheReport, memory calculations
+├── example_usage.py           # Standalone runnable model loader usage example
+├── example_kv_inspection.py   # Standalone runnable KV Cache inspection & memory simulation
+├── test_model_loader.py       # Unit tests for model loader (28 passing tests)
+├── test_kv_extractor.py       # Unit tests for KV cache inspection & memory calculations (14 passing tests)
+└── README.md                  # Architecture documentation and usage guide
 ```
 
 ---
@@ -56,100 +59,119 @@ Responsible for loading, preparing, and managing the model lifecycle:
   * `load()` caches `ModelArtifacts` to prevent duplicate memory allocations when accessed repeatedly.
   * `unload()` explicitly deletes references, triggers garbage collection (`gc.collect()`), and clears CUDA cache (`torch.cuda.empty_cache()`).
 
-### C. Exception Hierarchy (`exceptions.py`)
-All module errors inherit from `LLMEngineError`:
-* `DependencyMissingError`: Raised when runtime libraries (`torch`, `transformers`) are not installed.
-* `DeviceConfigurationError`: Raised for invalid device names or missing CUDA hardware.
-* `PrecisionConfigurationError`: Raised for unsupported floating point formats.
-* `ModelDownloadError`: Raised on Hugging Face Hub network errors or repository lookup failures.
-* `ModelInitializationError`: Raised on Out-of-Memory (OOM) or weight initialization failures.
-* `TokenizerInitializationError`: Raised if tokenizer fails to initialize.
+### C. KV Cache Extraction & Inspection (`kv_extractor.py`)
+Provides non-destructive extraction, inspection, and memory profiling of the model's Key-Value Cache:
+* **Supported Cache Representations:**
+  * **Hugging Face `DynamicCache`** (`transformers.cache_utils.DynamicCache`): standard across modern Transformers ($\ge 4.36$).
+  * **Legacy Tuple of Tuples:** `((key_0, value_0), (key_1, value_1), ..., (key_{L-1}, value_{L-1}))`.
+  * **List of Tuples / Custom Sequence Containers.**
+* **Tensor Layout Inspection:**
+  * Identifies standard 4D layout: `[batch_size, num_kv_heads, seq_len, head_dim]`.
+  * Automatically detects **Grouped Query Attention (GQA)** when `num_kv_heads < 8`.
+* **Memory Calculation Methodology:**
+  * **Logical Tensor Memory:** Calculated as $\text{numel} \times \text{element\_size\_bytes}$.
+  * **Physical Storage Tracking:** Queries underlying storage pointer (`untyped_storage().data_ptr()`) to avoid double-counting shared or preallocated tensor memory buffers.
+  * Reports memory precisely in bytes, kilobytes (KB), and megabytes (MB) at tensor, layer, and global cache levels.
+* **Structured Output (`CacheReport`):**
+  * Provides serialized dictionary (`to_dict()`) for integration with Person 2 (algorithm) and Person 3 (evaluation/dashboard).
+  * Provides formatted ASCII summary table (`summary_table()`).
 
 ---
 
-## 3. Usage Examples
+## 3. Qwen2.5-1.5B-Instruct Cache Architecture & Dimensions
 
-### Standard Usage with `ModelLoader`
+For our primary candidate model, `Qwen/Qwen2.5-1.5B-Instruct`, the KV Cache exhibits the following observed specifications:
+
+* **Transformer Layers ($L$):** 28
+* **Attention Heads:** 12 query heads, **2 key-value heads** (Grouped Query Attention - GQA)
+* **Head Dimension ($D$):** 128 ($1536 / 12$)
+* **Default Precision:** `bfloat16` / `float16` (2 bytes per element)
+* **Key/Value Tensor Shape per Layer:** `(batch_size, 2, seq_len, 128)`
+* **Memory Scaling per Token:**
+  $$\text{Elements per Token per Layer} = 2 \text{ (K + V)} \times 1 \text{ (batch)} \times 2 \text{ (KV heads)} \times 128 \text{ (head dim)} = 512 \text{ elements}$$
+  $$\text{Memory per Token per Layer} = 512 \times 2 \text{ bytes} = 1,024 \text{ bytes} = 1.00 \text{ KB}$$
+  $$\text{Total Memory per Token across 28 Layers} = 28 \times 1,024 \text{ bytes} = 28,672 \text{ bytes} = \mathbf{28.00 \text{ KB/token}}$$
+
+### Context Length Footprint Table
+| Sequence Length | Key/Value Shape | Total KV Cache Memory | Memory per Token |
+|:---|:---|:---|:---|
+| 128 tokens | `(1, 2, 128, 128)` | **3.50 MB** | 28.00 KB |
+| 512 tokens | `(1, 2, 512, 128)` | **14.00 MB** | 28.00 KB |
+| 2,048 tokens | `(1, 2, 2048, 128)` | **56.00 MB** | 28.00 KB |
+| 8,192 tokens | `(1, 2, 8192, 128)` | **224.00 MB** | 28.00 KB |
+| 32,768 tokens | `(1, 2, 32768, 128)` | **896.00 MB** | 28.00 KB |
+
+---
+
+## 4. Usage Examples
+
+### Inspecting KV Cache from Model Inference
 
 ```python
-from llm_engine import ModelLoader, ModelConfig
+from llm_engine import ModelLoader, ModelConfig, run_inference_and_inspect_cache
 
-# 1. Configure the model
-config = ModelConfig(
-    model_id="Qwen/Qwen2.5-1.5B-Instruct",
-    device="auto",        # Automatically selects CUDA if available, CPU otherwise
-    precision="auto",     # Selects BF16/FP16 on GPU, FP32 on CPU
-    use_cache=True,       # Required for DSAA KV cache management
-    padding_side="left",  # Standard for autoregressive decoders
-)
-
-# 2. Instantiate loader
+# 1. Load model and tokenizer
+config = ModelConfig(model_id="Qwen/Qwen2.5-1.5B-Instruct", device="auto")
 loader = ModelLoader(config)
+artifacts = loader.load()
 
-# 3. Load artifacts
-try:
-    artifacts = loader.load()
-    model = artifacts.model
-    tokenizer = artifacts.tokenizer
-    print(f"Loaded on {artifacts.device} with precision {artifacts.dtype}")
-except Exception as e:
-    print(f"Failed to load: {e}")
+# 2. Run inference and extract cache report
+outputs, report = run_inference_and_inspect_cache(
+    model=artifacts.model,
+    tokenizer=artifacts.tokenizer,
+    prompt="Explain KV Cache in Large Language Models."
+)
 
-# 4. Access cached model & tokenizer later
-model = loader.get_model()
-tokenizer = loader.get_tokenizer()
+# 3. Print human-readable summary
+print(report.summary_table())
 
-# 5. Clean up memory when finished
-loader.unload()
+# 4. Programmatic access for algorithm/eval modules
+print(f"Total KV Memory: {report.total_mb:.2f} MB")
+print(f"Layer 0 Key shape: {report.layers[0].key.shape}")
+print(f"Layer 0 Total bytes: {report.layers[0].total_bytes} bytes")
 ```
 
-### Quick One-Liner
+### Inspecting an Existing `past_key_values` Object
 
 ```python
-from llm_engine import load_model_and_tokenizer
+from llm_engine import extract_kv_cache
 
-artifacts = load_model_and_tokenizer(
-    model_id="Qwen/Qwen2.5-1.5B-Instruct",
-    device="auto",
-    precision="auto"
-)
-model = artifacts.model
-tokenizer = artifacts.tokenizer
+# past_key_values can be DynamicCache or tuple of tuples
+report = extract_kv_cache(past_key_values)
+print(f"Detected cache type: {report.cache_type}")
+print(f"Total KV cache size: {report.total_kb:.2f} KB")
 ```
 
 ---
 
-## 4. Running Tests
+## 5. Running Tests
 
-Unit tests are located directly in `llm_engine/test_model_loader.py` and run without requiring external weights or active GPUs by utilizing mocks.
+Unit tests are strictly self-contained within `llm_engine/` and run without external downloads or active GPUs.
 
-To run the full test suite:
-
+Run all tests:
 ```bash
+python -m unittest discover -s llm_engine -p "test_*.py" -v
+```
+
+Or run individual suites:
+```bash
+# Model Loader tests (28 tests)
 python -m unittest llm_engine.test_model_loader -v
+
+# KV Cache Extractor tests (14 tests)
+python -m unittest llm_engine.test_kv_extractor -v
 ```
 
-### Verified Test Categories (28 Tests):
-1. **ModelConfig Validation:** Default parameters, custom valid parameters, rejection of empty model IDs, invalid devices, invalid precisions, and invalid padding sides.
-2. **Device Selection:** Auto-detection with CUDA available/unavailable, explicit CPU, explicit CUDA, and explicit CUDA indexing (`cuda:0`).
-3. **Precision Selection:** Auto precision on CUDA (BF16 vs FP16), auto on CPU (FP32), explicit FP32, explicit FP16 CPU rejection, explicit BF16 unsupported GPU rejection.
-4. **Dependency Handling:** Graceful detection and specific exception raising when `torch` or `transformers` is missing.
-5. **Model Loader Lifecycle:** Initial state, eval mode configuration, requires_grad freezing, use_cache setting, left-padding assignment, pad-token fallback, idempotent caching, and clean resource unloading.
-6. **Error Handling:** Tokenizer download failures, model weight download failures, and CUDA Out of Memory (OOM) scenarios.
+Total: **42 tests, 0 failures, 0 errors**.
 
 ---
 
-## 5. Standalone Example Script
-
-Run the standalone example script inside `llm_engine`:
+## 6. Standalone Demonstration Scripts
 
 ```bash
+# Model loader demonstration
 python -m llm_engine.example_usage
+
+# KV Cache inspection & memory simulation
+python -m llm_engine.example_kv_inspection
 ```
-
----
-
-## 6. Current Limitations & Next Step
-
-* **Local Environment Dependencies:** In environments where `torch` or `transformers` have not yet been installed, `ModelLoader` safely catches the missing dependency and outputs explicit installation instructions.
-* **Next Task (Task 2):** KV Cache inspection utilities (`kv_extractor.py`) to inspect tensor shapes, layers, attention heads, and exact memory consumption of the cached Key/Value states during generation.

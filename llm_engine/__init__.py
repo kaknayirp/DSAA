@@ -30,6 +30,15 @@ from .model_loader import (
     ModelArtifacts,
     load_model_and_tokenizer,
 )
+from .kv_extractor import (
+    KVCacheInspector,
+    CacheReport,
+    LayerCacheStats,
+    TensorStats,
+    KVCacheInspectionError,
+    extract_kv_cache,
+    run_inference_and_inspect_cache,
+)
 
 __all__ = [
     "ModelConfig",
@@ -50,4 +59,11 @@ __all__ = [
     "ModelLoader",
     "ModelArtifacts",
     "load_model_and_tokenizer",
+    "KVCacheInspector",
+    "CacheReport",
+    "LayerCacheStats",
+    "TensorStats",
+    "KVCacheInspectionError",
+    "extract_kv_cache",
+    "run_inference_and_inspect_cache",
 ]
