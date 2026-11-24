@@ -41,6 +41,7 @@ from .api_schemas import (
     ErrorResponse,
 )
 from .exceptions import (
+    LLMEngineError,
     QueueFullError,
     RequestNotFoundError,
     RequestCancelledError,
@@ -199,6 +200,14 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"error": "InferenceExecutionFailure", "detail": str(exc), "code": 500},
+        )
+
+    @app.exception_handler(LLMEngineError)
+    async def llm_engine_error_handler(request: Request, exc: LLMEngineError):
+        """Return a structured response for loader, device, cache, and engine errors."""
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": "LLMEngineFailure", "detail": str(exc), "code": 500},
         )
 
     # --------------------------------------------------------------------------

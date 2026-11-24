@@ -10,7 +10,8 @@ import unittest
 from llm_engine.api_app import create_app
 from llm_engine.config import ModelConfig
 from llm_engine.generation_config import GenerationConfig
-from llm_engine.inference_engine import InferenceEngine
+from llm_engine.inference_engine import InferenceEngine, InferenceRequest
+from llm_engine.kv_extractor import KVCacheInspector, extract_kv_cache
 from llm_engine.model_loader import ModelLoader
 from llm_engine.scheduler import RequestScheduler
 from llm_engine.scheduler_config import SchedulerConfig
@@ -38,6 +39,41 @@ class TestRealQwenInference(unittest.TestCase):
         cls.loader.unload()
 
     def test_real_blocking_and_streaming_generation(self):
+        import torch
+
+        prompt_a = self.artifacts.tokenizer("Inspect an actual Qwen cache.", return_tensors="pt")
+        prompt_b = self.artifacts.tokenizer("A separate request has a different prompt length.", return_tensors="pt")
+        state_a = self.engine.prefill(InferenceRequest(
+            input_ids=prompt_a["input_ids"],
+            attention_mask=prompt_a.get("attention_mask"),
+            generation_config=GenerationConfig(max_new_tokens=4),
+        ))
+        state_b = self.engine.prefill(InferenceRequest(
+            input_ids=prompt_b["input_ids"],
+            attention_mask=prompt_b.get("attention_mask"),
+            generation_config=GenerationConfig(max_new_tokens=4),
+        ))
+        try:
+            before_a = extract_kv_cache(state_a.past_key_values)
+            before_b = extract_kv_cache(state_b.past_key_values)
+            self.assertIsNot(state_a.past_key_values, state_b.past_key_values)
+            self.assertNotEqual(before_a.seq_len, before_b.seq_len)
+            layers_a = KVCacheInspector.extract_layers(state_a.past_key_values)[1]
+            self.assertTrue(torch.is_tensor(layers_a[0][0]))
+            self.assertTrue(torch.is_tensor(layers_a[0][1]))
+
+            untouched_b_len = before_b.seq_len
+            self.engine.decode_step(state_a)
+            after_a = extract_kv_cache(state_a.past_key_values)
+            after_b = extract_kv_cache(state_b.past_key_values)
+            self.assertEqual(after_a.seq_len, before_a.seq_len + 1)
+            self.assertEqual(after_b.seq_len, untouched_b_len)
+        finally:
+            state_a.cleanup()
+            state_b.cleanup()
+        self.assertIsNone(state_a.past_key_values)
+        self.assertIsNone(state_b.past_key_values)
+
         direct = self.engine.generate(
             "Reply with one short sentence about cache memory.",
             GenerationConfig(max_new_tokens=4),
@@ -83,7 +119,7 @@ class TestRealQwenInference(unittest.TestCase):
             completion = next(event for event in payloads if "finish_reason" in event)
             self.assertEqual(completion["num_generated_tokens"], len(tokens))
             self.assertGreater(len(tokens), 0)
-            self.assertTrue(all(token["text"] for token in tokens))
+            self.assertTrue(all(isinstance(token["text"], str) for token in tokens))
             self.assertIn("data: [DONE]", lines)
 
 

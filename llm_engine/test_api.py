@@ -33,6 +33,7 @@ from llm_engine.inference_engine import InferenceEngine
 from llm_engine.model_loader import ModelArtifacts
 from llm_engine.test_inference_engine import StatefulCausalLM, MockTokenizer
 from llm_engine.api_app import create_app
+from llm_engine.exceptions import DependencyMissingError
 
 
 class TestModelServingAPI(unittest.TestCase):
@@ -164,6 +165,22 @@ class TestModelServingAPI(unittest.TestCase):
         self.assertEqual(completion["finish_reason"], "stop_sequence")
         self.assertEqual(completion["num_generated_tokens"], len(token_events))
         self.assertEqual(len(token_events), 1)
+
+    def test_model_loader_dependency_error_is_structured(self):
+        class MissingRuntimeLoader:
+            is_loaded = False
+
+            def load(self):
+                raise DependencyMissingError("torch", "install the project dependencies")
+
+        engine = InferenceEngine(model_loader=MissingRuntimeLoader())
+        scheduler = RequestScheduler(engine, config=SchedulerConfig(max_batch_size=1))
+        client = TestClient(create_app(scheduler, start_background_worker=False))
+        response = client.post("/generate", json={"prompt": "Trigger lazy model loading"})
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "LLMEngineFailure")
+        self.assertIn("torch", response.json()["detail"])
 
     def test_request_status_lifecycle(self):
         """GET /requests/{request_id} returns accurate execution state."""

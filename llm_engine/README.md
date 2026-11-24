@@ -3,7 +3,7 @@
 **Module Owner:** Person 1 — LLM & KV Cache Engineer  
 **Project:** DSAA (Dynamic Smart Attention-based Allocation)
 
-The `llm_engine/` module is the foundation of the DSAA system. It provides the complete LLM infrastructure: loading pretrained language models, managing hardware device and precision mapping, extracting and inspecting the Key-Value (KV) Cache, executing autoregressive inference, managing continuous batching request scheduling, and exposing the entire infrastructure through a robust, production-grade FastAPI serving layer.
+The `llm_engine/` module connects model loading, autoregressive inference, per-request KV Cache management, request scheduling, and a FastAPI serving layer. The API and scheduler are tested with deterministic mocks. The optional real-Qwen test requires PyTorch, Transformers, cached model files, and a functioning local event loop. The scheduler interleaves requests but currently executes each request's model forward pass serially; it does not form tensor batches.
 
 ---
 
@@ -29,11 +29,13 @@ llm_engine/
 ├── example_inference.py            # Standalone runnable autoregressive generation & cache reuse demo
 ├── example_continuous_batching.py  # Standalone runnable continuous batching dynamic entry/exit demo
 ├── example_server.py               # Standalone runnable API server & client demonstration
-├── test_model_loader.py            # Unit tests for model loader (28 passing tests)
-├── test_kv_extractor.py            # Unit tests for KV cache inspection & memory calculations (14 passing tests)
-├── test_inference_engine.py        # Unit tests for inference engine & KV cache integration (18 passing tests)
-├── test_scheduler.py               # Unit tests for continuous batching and scheduling (13 passing tests)
-├── test_api.py                     # Unit and integration tests for serving API (11 passing tests)
+├── test_model_loader.py            # Model loader tests (mocked dependencies)
+├── test_kv_extractor.py             # Cache inspection tests (synthetic tensors)
+├── test_inference_engine.py        # Inference tests (mock model and tokenizer)
+├── test_scheduler.py               # Scheduler tests (mock model and tokenizer)
+├── test_api.py                     # API and SSE tests (mock model and tokenizer)
+├── test_real_model_integration.py  # Opt-in local Qwen integration test
+└── README.md                       # Usage, architecture, verification, and limitations
 └── README.md                       # Complete technical documentation and usage guide
 ```
 
@@ -138,10 +140,12 @@ Generates text from prompt. Supports blocking JSON or streaming Server-Sent Even
 }
 ```
 
+All response values below are illustrative schema examples, not measured output.
+
 **Response (Blocking JSON):**
 ```json
 {
-  "request_id": "47457df8",
+    "request_id": "<request-id>",
   "model": "Qwen/Qwen2.5-1.5B-Instruct",
   "generated_text": "The KV Cache stores previous keys and values...",
   "finish_reason": "max_tokens",
@@ -150,23 +154,23 @@ Generates text from prompt. Supports blocking JSON or streaming Server-Sent Even
   "total_time_seconds": 0.42,
   "tokens_per_second": 152.38,
   "kv_cache_summary": {
-    "total_bytes": 102400,
-    "total_kb": 100.0,
-    "total_mb": 0.0977,
-    "num_layers": 4,
+    "total_bytes": 4300800,
+    "total_kb": 4200.0,
+    "total_mb": 4.1016,
+    "num_layers": 28,
     "seq_len": 75,
     "is_gqa": true
   }
 }
 ```
 
-**Streaming (SSE - `stream: true`):**
+**Streaming (SSE - `stream: true`; schematic placeholders):**
 ```text
-data: {"request_id": "e5707ad8", "token_id": 42, "text": "The"}
+data: {"request_id": "<request-id>", "token_id": <model-token-id>, "text": "<decoded text delta>"}
 
-data: {"request_id": "e5707ad8", "token_id": 105, "text": " KV"}
+data: {"request_id": "<request-id>", "token_id": <model-token-id>, "text": "<decoded text delta>"}
 
-data: {"request_id": "e5707ad8", "finish_reason": "completed", "num_generated_tokens": 2}
+data: {"request_id": "<request-id>", "finish_reason": "max_tokens", "num_prompt_tokens": 8, "num_generated_tokens": 2, "total_time_seconds": 0.12, "tokens_per_second": 16.67}
 
 data: [DONE]
 ```
@@ -227,20 +231,76 @@ client; this also uses the configured pretrained model.
 
 ---
 
-## 6. Running the Complete Test Suite
+## 6. Installation and Model Setup
 
-All 84 unit and integration tests across `llm_engine/` are strictly self-contained:
+Use a 64-bit Python environment and install PyTorch for the desired compute platform. For Windows CPU-only setup:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+```
+
+For CUDA, first confirm an NVIDIA GPU and driver with `nvidia-smi`, then choose the matching Windows/Pip/CUDA command from the official PyTorch installer selector. The repository requirements are currently unpinned, so installs are not version-locked.
+
+The default server model is `Qwen/Qwen2.5-1.5B-Instruct`. `ModelLoader.load()` downloads the tokenizer and weights on first use and caches them in the Hugging Face cache. This requires network access on first load and enough system memory for the chosen precision. The current Python model loader uses float32 on CPU by default; available RAM was not measured as part of the unit suite.
+
+## 7. Execution Flow and Module Responsibilities
+
+```text
+HTTP request -> FastAPI schema/auth -> RequestScheduler.submit()
+ -> InferenceEngine tokenizer/prefill -> model forward(use_cache=True)
+ -> token selection -> decode_step(token + past_key_values)
+ -> scheduler completion -> JSON response or SSE events
+```
+
+- `model_loader.py`: loads pretrained weights and tokenizer, sets evaluation mode, disables gradients, and enables model cache use.
+- `inference_engine.py`: prefill, sampling, stopping, incremental cache passing/updating, timing, and result construction.
+- `kv_extractor.py`: reads cache tensor shape/dtype/storage metadata. Logical cache bytes are computed from tensors; this is not process RSS or total GPU memory.
+- `scheduler.py` and `request_tracker.py`: queueing, admission, per-request state, cancellation, and request-level cache cleanup.
+- `api_app.py` and `api_schemas.py`: health/model endpoints, blocking generation, SSE, request status/cancel, input validation, and optional API-key middleware.
+
+**Batching limitation:** `max_batch_size` controls how many requests can be active. `RequestScheduler.step()` invokes `engine.prefill()` or `engine.decode_step()` separately for each request. Requests share scheduling iterations, not one batched tensor forward pass. Do not interpret this as GPU tensor batching or throughput batching.
+
+## 8. API Usage
+
+Start the server with `python -m llm_engine.example_server`. It loads the real model on the first generation request. Before that request, `/health` can correctly report `model_loaded: false`.
+
+```powershell
+curl.exe http://127.0.0.1:8000/health
+curl.exe http://127.0.0.1:8000/models
+curl.exe -X POST http://127.0.0.1:8000/generate -H "Content-Type: application/json" -d '{"prompt":"Explain KV caching briefly.","max_new_tokens":32}'
+curl.exe -N -X POST http://127.0.0.1:8000/generate -H "Content-Type: application/json" -d '{"prompt":"Explain KV caching briefly.","max_new_tokens":32,"stream":true}'
+```
+
+Streaming emits token events, then a completion event with `finish_reason`, counts, and measured timing fields, followed by `data: [DONE]`. An EOS token can have empty visible text because special tokens are skipped during decoding.
+
+## 9. Test Suite
+
+Run the complete test suite from the repository root:
 
 ```bash
-# Run all 84 tests across all 5 milestones
+# Run unit/API tests plus the opt-in real-model test (skipped by default)
 python -m unittest discover -s llm_engine -p "test_*.py" -v
 ```
 
-### Breakdown by Component:
-1. **Model Loader Tests (28 tests):** `python -m unittest llm_engine.test_model_loader -v`
-2. **KV Cache Extractor Tests (14 tests):** `python -m unittest llm_engine.test_kv_extractor -v`
-3. **Inference Engine Tests (18 tests):** `python -m unittest llm_engine.test_inference_engine -v`
-4. **Scheduler & Continuous Batching Tests (13 tests):** `python -m unittest llm_engine.test_scheduler -v`
-5. **Model Serving & API Tests (11 tests):** `python -m unittest llm_engine.test_api -v`
+The latest full run was **88 run, 0 failures, 1 skipped** (87 passed). The skip is `test_real_model_integration.py`; it requires `DSAA_RUN_REAL_MODEL_TESTS=1` and locally cached model files. The 87 passing tests use mocks, synthetic tensors, or API test doubles; they do not verify actual Qwen inference. In this managed environment, run TestClient tests outside the sandbox because sandboxed local socket-pair creation can block AnyIO's event loop. This restriction does not apply to a normal local terminal.
 
-Total: **84 tests, 0 failures, 0 errors**.
+Run the local-cache-only real-model integration test after downloading model files:
+
+```powershell
+$env:DSAA_RUN_REAL_MODEL_TESTS = "1"
+python -m unittest llm_engine.test_real_model_integration -v
+```
+
+## 10. Measurements and Known Limitations
+
+- Inference result timing includes measured prefill/decode execution; model download/load time is not returned as a metric.
+- TTFT is not a dedicated field. The code has prefill latency, but no end-to-end TTFT measurement.
+- `tokens_per_second` is generated-token count divided by request inference elapsed time; it is not a benchmark across repeated runs.
+- Cache reports estimate cache tensor bytes and optionally storage allocation. They do not measure peak process RAM, allocator-reserved GPU memory, CPU/GPU utilization, or concurrent system-wide footprint.
+- `test_real_model_integration.py` tests local weights only and is skipped by default. In the environment used for the latest run, explicitly enabling it produced a setup error because the Qwen files were not cached; the test does not download them. Available RAM was about 1.5 GB, below the roughly 6.2 GB needed just for 1.54B float32 parameters, before runtime overhead. Real Qwen inference and real cache tensors therefore remain unverified here.
+- API and scheduler unit tests use mocks. Their passing results establish control-flow behavior, not model quality or real-model performance.
+- The scheduler interleaves requests but performs per-request forwards; true tensor batching, DSAA cache eviction, semantic scoring, and full benchmark evaluation are outside this LLM infrastructure module's implemented scope.
