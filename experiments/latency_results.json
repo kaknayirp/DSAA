@@ -1,0 +1,36 @@
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "device": "mps",
+  "prompt_tokens": 26,
+  "prefill_time_ms": 31348.942834,
+  "scoring_overhead_ms": {
+    "attention": 0.86415625,
+    "semantic": 0.5187521,
+    "recency": 0.0051105,
+    "combined_pressure": 0.32530205,
+    "total": 1.7133209000000003
+  },
+  "pruning_overhead_ms": {
+    "80_selection": 0.05018545,
+    "80_reconstruction": 2.9737416,
+    "80_total": 3.0239270499999997,
+    "50_selection": 0.0490458,
+    "50_reconstruction": 3.1761353999999997,
+    "50_total": 3.2251811999999997
+  },
+  "kv_cache_bytes": {
+    "baseline": 1490944,
+    "dsaa_80": 1204224,
+    "dsaa_50": 745472
+  },
+  "single_token_decoding_ms": {
+    "baseline": 29835.8453461,
+    "dsaa_80": 22137.296975100002,
+    "dsaa_50": 31222.7643375
+  },
+  "multi_step_decoding_ms": {
+    "baseline_per_step": 50045.2621,
+    "dsaa_80_per_step": 38802.6825832,
+    "dsaa_50_per_step": 40036.717300000004
+  }
+}
