@@ -107,6 +107,9 @@ export function BackendStatus() {
       {modelsError && connection === 'online' && (
         <p className="status-note" role="status">{modelsError}</p>
       )}
+      {health && !health.model_loaded && (
+        <p className="status-note" role="status">The model loads on the first generation request, so the initial response may take longer.</p>
+      )}
       <p className="status-footnote">
         {lastChecked ? `Last checked ${lastChecked.toLocaleTimeString()}` : 'Checking every 15 seconds'}
         {health?.status && health.status !== 'healthy' ? ` · API reports ${health.status}` : ''}
